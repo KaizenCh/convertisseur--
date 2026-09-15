@@ -2,6 +2,16 @@
 class_name GeometryBuilder
 extends RefCounted
 
+static func _find_first_mesh(node: Node) -> Mesh:
+	if node is MeshInstance3D and (node as MeshInstance3D).mesh != null:
+		return (node as MeshInstance3D).mesh
+	for child in node.get_children():
+		var res := _find_first_mesh(child)
+		if res != null:
+			return res
+	return null
+
+
 static func build_geometry_placement(
 	placement: Variant,
 	asset_map: Variant,
@@ -55,30 +65,64 @@ static func build_geometry_placement(
 		var base_tf_data_raw = p_dict.get("reconstruction_transform", p_dict.get("final_world_transform", {}))
 		var base_tf := TransformConverter.transform_from_v10(base_tf_data_raw)
 
+		var valid_transforms: Array[Transform3D] = []
+		for tf_item in inst_list:
+			if tf_item == null or not (tf_item is Dictionary):
+				continue
+			var inst_tf := TransformConverter.transform_from_v10(tf_item)
+			if not p_dict.has("instance_final_world_transforms"):
+				inst_tf = base_tf * inst_tf
+			valid_transforms.append(inst_tf)
+
+		if valid_transforms.is_empty():
+			stats["instantiate_failure"] = stats.get("instantiate_failure", 0) + 1
+			return
+
+		# For multi-instance ISMs, use MultiMeshInstance3D to prevent GPU buffer/drawcall exhaustion
+		if valid_transforms.size() > 1:
+			var temp_inst = glb_resource.instantiate()
+			var base_mesh: Mesh = null
+			if temp_inst != null:
+				base_mesh = _find_first_mesh(temp_inst)
+
+			if base_mesh != null:
+				var mm_node := MultiMeshInstance3D.new()
+				mm_node.name = actor_name
+				var multimesh := MultiMesh.new()
+				multimesh.transform_format = MultiMesh.TRANSFORM_3D
+				multimesh.mesh = base_mesh
+				multimesh.instance_count = valid_transforms.size()
+
+				for idx in range(valid_transforms.size()):
+					multimesh.set_instance_transform(idx, valid_transforms[idx])
+
+				mm_node.multimesh = multimesh
+				root_node.add_child(mm_node)
+				mm_node.owner = root_node
+
+				temp_inst.free()
+
+				stats["built_placements"] = stats.get("built_placements", 0) + 1
+				stats["built_ism_instances"] = stats.get("built_ism_instances", 0) + valid_transforms.size()
+				return
+			elif temp_inst != null:
+				temp_inst.free()
+
+		# Fallback for single instance or non-mesh ISM
 		var container := Node3D.new()
 		container.name = actor_name + "_ISM"
 		root_node.add_child(container)
 		container.owner = root_node
 
 		var built_inst_count := 0
-		for i in range(inst_list.size()):
-			var tf_item = inst_list[i]
-			if tf_item == null or not (tf_item is Dictionary):
-				continue
-			var inst_tf := TransformConverter.transform_from_v10(tf_item)
-
-			# If instance_transforms was used instead of instance_final_world_transforms,
-			# compose with base transform
-			if not p_dict.has("instance_final_world_transforms"):
-				inst_tf = base_tf * inst_tf
-
+		for i in range(valid_transforms.size()):
 			var instance = glb_resource.instantiate()
 			if instance == null:
 				stats["instantiate_failure"] = stats.get("instantiate_failure", 0) + 1
 				continue
 
 			if instance is Node3D:
-				(instance as Node3D).transform = inst_tf
+				(instance as Node3D).transform = valid_transforms[i]
 
 			instance.name = str(actor_name) + "_inst_" + str(i)
 			container.add_child(instance)

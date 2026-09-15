@@ -1,17 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Render-target bake utilities — shared by the Landscape bake (step3) and the
-decal texture bake (step4). Both need the same trick for the same reason:
-neither the UE Python API nor PIL (unavailable in the editor) gives access
-to raw pixels, so a temporary material/capture renders into a
-TextureRenderTarget2D which is then exported to PNG via
-RenderingLibrary.export_render_target().
-
-Ported faithfully from unreal_export_landscape.py::bake_base_color() and
-unreal_export_decals_vfx.py::export_texture_to_png() (repo root, the
-validated reference) — this used to exist twice, implemented independently,
-in the two original scripts; unified here per §6.5-style factorization,
-same spirit as raycast_grid_heights().
+decal texture bake (step4).
 """
 
 import os
@@ -28,12 +18,6 @@ except ImportError:
 
 
 def get_capture_component(capture_actor: Any) -> Any:
-    """Returns the live SceneCaptureComponent2D instance.
-
-    get_editor_property("capture_component2d") hands back the actor's
-    component TEMPLATE, which refuses writes on several properties. Asking
-    the spawned actor for its component by class returns the real instance.
-    """
     component = None
     try:
         component = capture_actor.get_component_by_class(unreal.SceneCaptureComponent2D)
@@ -55,13 +39,6 @@ def get_capture_component(capture_actor: Any) -> Any:
 
 
 def restrict_capture_to(component: Any, actors: List[Any]) -> bool:
-    """Makes a SceneCapture render only `actors`, nothing else.
-
-    Without this, everything else standing in view would be painted into
-    the bake. Three strategies are tried in order, since which one is
-    writable depends on the engine version. Returns True only if the
-    capture is genuinely restricted — a bake is not attempted "wide open".
-    """
     try:
         component.set_editor_property(
             "primitive_render_mode",
@@ -117,18 +94,6 @@ def bake_top_down_base_color(
     output_png_path: str,
     resolution: int = 4096,
 ) -> bool:
-    """Top-down orthographic BaseColor capture of `restrict_to_actors` only.
-
-    BaseColor = unlit albedo, deliberately: the props exported by the rest
-    of the pipeline are re-lit by Godot, so baking Unreal's own lighting
-    into the terrain would make the two visually disagree.
-
-    Camera at pitch=-90/yaw=0: screen right = world +Y, screen up =
-    world +X — core.glb.build_grid_mesh()'s UVs are derived from exactly
-    this framing, so do not change one without the other.
-
-    Always destroys the temporary capture actor, even on failure.
-    """
     if unreal is None:
         return False
 
@@ -208,12 +173,11 @@ def export_texture_to_png(
     resolution: int = 1024,
     temp_package: str = "/Game/UE2Godot/_TextureBakeTemp",
 ) -> bool:
-    """Draws a Texture2D through a throwaway unlit material into a render
-    target and exports it as PNG — the only route Python has to raw pixels.
+    """Draws a Texture2D through a reusable unlit material into a render target and exports it as PNG.
 
-    The temporary material is always deleted, even on failure.
+    Reuses the temporary material asset to prevent GC ForceDelete package corruption and modal dialog locks.
     """
-    if unreal is None:
+    if unreal is None or texture is None:
         return False
 
     MEL = unreal.MaterialEditingLibrary
@@ -223,14 +187,24 @@ def export_texture_to_png(
         asset_path = temp_package + "/" + name
 
         if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
-            unreal.EditorAssetLibrary.delete_asset(asset_path)
-        unreal.EditorAssetLibrary.make_directory(temp_package)
+            try:
+                material = unreal.load_asset(asset_path)
+            except Exception:
+                material = None
 
-        material = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
-            name, temp_package, unreal.Material, unreal.MaterialFactoryNew()
-        )
+        if material is None:
+            unreal.EditorAssetLibrary.make_directory(temp_package)
+            material = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
+                name, temp_package, unreal.Material, unreal.MaterialFactoryNew()
+            )
+
         if material is None:
             return False
+
+        try:
+            MEL.disconnect_material_expressions(material)
+        except Exception:
+            pass
 
         material.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
 
@@ -261,25 +235,9 @@ def export_texture_to_png(
     finally:
         if material is not None:
             try:
-                unreal.EditorAssetLibrary.delete_asset(material.get_path_name())
+                MEL.disconnect_material_expressions(material)
             except Exception:
                 pass
-
-
-# ======================================================================
-# EXTRACTION DE TEXTURE — trois voies
-# ======================================================================
-#
-# Le bake par render target (export_texture_to_png ci-dessus) est la voie
-# principale : c'est la seule qui passe par le rendu, donc la seule qui
-# capture correctement une texture virtuelle ou compressée d'une manière
-# que la lecture directe ne saurait pas décoder.
-#
-# Mais elle a trois points de fragilité réels : elle crée un asset
-# temporaire (interdit si le projet est en lecture seule ou sous contrôle
-# de source strict), elle dépend de la compilation d'un shader (qui peut
-# échouer ou rester en file d'attente), et elle nécessite un monde valide.
-# D'où deux voies alternatives qui ne partagent aucune de ces dépendances.
 
 
 def _validate_png(path: Optional[str]) -> Tuple[bool, str]:
@@ -290,8 +248,6 @@ def _validate_png(path: Optional[str]) -> Tuple[bool, str]:
     size = os.path.getsize(path)
     if size < 512:
         return False, f"fichier suspect ({size} octets)"
-    # Signature PNG réelle : un render target vide ou un fichier tronqué
-    # peut peser plusieurs kilo-octets et n'être pourtant pas une image.
     try:
         with open(path, "rb") as handle:
             magic = handle.read(8)
@@ -315,14 +271,6 @@ def _export_task_available() -> bool:
 
 
 def _texture_via_export_task(world, texture, output_path, resolution=1024):
-    """Export direct de l'asset texture, sans render target ni shader.
-
-    Passe par le système d'export générique du moteur : ni asset
-    temporaire, ni compilation, ni monde nécessaire. Rend les pixels tels
-    qu'ils sont stockés dans l'asset — ce qui est exactement ce qu'on veut
-    pour un masque ou une normal map, et ce qui diffère du rendu seulement
-    pour les cas où une transformation shader intervenait.
-    """
     if unreal is None:
         return None
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -345,18 +293,6 @@ def _source_file_available() -> bool:
 
 
 def _texture_via_source_file(world, texture, output_path, resolution=1024):
-    """Copie le fichier source d'origine, celui qui a servi à l'import.
-
-    Une texture importée conserve le chemin de son fichier source. Quand
-    ce fichier est encore présent sur le disque, c'est la MEILLEURE
-    donnée disponible : ni recompressée, ni rendue, ni redimensionnée —
-    l'original.
-
-    Deux garde-fous indispensables : on n'accepte que des formats que
-    Godot sait lire, et on refuse un source file qui ne serait pas une
-    image (le champ peut pointer vers un .uasset intermédiaire selon le
-    pipeline d'import du projet).
-    """
     if unreal is None or texture is None:
         return None
 
@@ -393,10 +329,6 @@ def _texture_via_source_file(world, texture, output_path, resolution=1024):
     if extension not in (".png", ".tga", ".jpg", ".jpeg", ".bmp", ".exr", ".hdr"):
         return None
 
-    # Le reste du pipeline attend un PNG à ce chemin précis. Si la source
-    # est déjà un PNG, copie directe ; sinon on refuse plutôt que de
-    # renommer un TGA en .png, ce qui produirait un fichier que Godot
-    # rejetterait à l'import sans message clair.
     if extension != ".png":
         return None
 
@@ -420,9 +352,7 @@ def build_texture_export_chain(enable_task: bool = True,
             run=_texture_via_export_task,
             available=_export_task_available,
             quality="full",
-            caveat=("pixels de l'asset, sans passe de rendu : identique pour un "
-                    "masque ou une normale, peut différer si un shader "
-                    "transformait la texture"),
+            caveat=("pixels de l'asset, sans passe de rendu"),
         ))
     if enable_source:
         strategies.append(Strategy(
@@ -430,17 +360,12 @@ def build_texture_export_chain(enable_task: bool = True,
             run=_texture_via_source_file,
             available=_source_file_available,
             quality="full",
-            caveat="fichier source d'import copié tel quel (non recompressé)",
+            caveat="fichier source d'import copié tel quel",
         ))
     return StrategyChain("texture_export", strategies, _validate_png)
 
 
 def export_texture_with_fallbacks(world, texture, output_path,
                                   resolution: int = 1024, chain=None):
-    """Point d'entrée recommandé : renvoie le StrategyOutcome complet.
-
-    On rend l'outcome, pas un booléen : l'appelant doit pouvoir dire dans
-    son rapport PAR QUELLE voie la texture a été obtenue.
-    """
     chain = chain or build_texture_export_chain()
     return chain.run(world, texture, output_path, resolution)
