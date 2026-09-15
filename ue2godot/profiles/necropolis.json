@@ -1,0 +1,44 @@
+{
+  "profile_name": "necropolis",
+  "_note": "Conventions du pack Necropolis. L'ordre des listes est significatif : le premier candidat trouvé gagne.",
+
+  "decals": {
+    "material_parameters": {
+      "mask": ["Mask", "Opacity Mask", "Alpha"],
+      "tint": ["Tint 02", "Tint 01", "Tint", "Color"],
+      "normal": ["Normal", "NormalMap"]
+    },
+    "tint_fallback": [1.0, 1.0, 1.0],
+    "flat_mask_policy": "warn"
+  },
+
+  "vfx": {
+    "mode": "markers",
+    "category_rules": [
+      {"match": "candle", "category": "candle"},
+      {"match": "torch", "category": "torch"},
+      {"match": "campfire", "category": "fire"},
+      {"match": "bonfire", "category": "fire"},
+      {"match": "brazier", "category": "fire"},
+      {"match": "fire", "category": "fire"},
+      {"match": "smoke", "category": "smoke"},
+      {"match": "steam", "category": "steam"},
+      {"match": "dust", "category": "smoke"},
+      {"match": "spark", "category": "spark"},
+      {"match": "ember", "category": "spark"}
+    ],
+    "max_lights": 24,
+    "light_min_spacing_m": 6.0,
+    "calibration": {
+      "source": "constants",
+      "torch_assumed_height_m": 1.40,
+      "candle_assumed_height_m": 0.05
+    }
+  },
+
+  "landscape": {
+    "material_folder": "/Game/LandscapeMaterials",
+    "grid_resolution": 256,
+    "texture_resolution": 4096
+  }
+}
